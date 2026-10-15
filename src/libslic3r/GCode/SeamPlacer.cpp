@@ -776,6 +776,14 @@ struct SeamComparator {
     if (b.embedded_distance < -0.5f && a.embedded_distance > -0.5f) {
       return false;
     }
+    // Back: among hidden points prefer the deeper one. Compared in 0.5 mm steps, so tiny differences do not decide.
+    if (setup == SeamPosition::spRear && a.embedded_distance < -0.5f && b.embedded_distance < -0.5f) {
+      const int depth_a = int(std::floor(a.embedded_distance / 0.5f));
+      const int depth_b = int(std::floor(b.embedded_distance / 0.5f));
+      if (depth_a != depth_b) {
+        return depth_a < depth_b;
+      }
+    }
 
     if (setup == SeamPosition::spRear && a.position.y() != b.position.y()) {
       return a.position.y() > b.position.y();
@@ -833,6 +841,14 @@ struct SeamComparator {
     }
     if (b.embedded_distance < -0.5f && a.embedded_distance > -0.5f) {
       return false;
+    }
+    // Back: among hidden points prefer the deeper one. Compared in 0.5 mm steps, so tiny differences do not decide.
+    if (setup == SeamPosition::spRear && a.embedded_distance < -0.5f && b.embedded_distance < -0.5f) {
+      const int depth_a = int(std::floor(a.embedded_distance / 0.5f));
+      const int depth_b = int(std::floor(b.embedded_distance / 0.5f));
+      if (depth_a != depth_b) {
+        return depth_a < depth_b;
+      }
     }
 
     if (setup == SeamPosition::spRandom) {
@@ -1087,7 +1103,7 @@ void SeamPlacer::calculate_overhangs_and_layer_embedding(const PrintObject *po) 
                           if (prev_layer_distancer.get() != nullptr) {
                             const auto _dist = prev_layer_distancer->distance_from_lines<true>(point.cast<double>());
                             perimeter_point.overhang = _dist
-                                                       + 0.65f * perimeter_point.perimeter.flow_width
+                                                       + 0.6f * perimeter_point.perimeter.flow_width
                                                        - tan(SeamPlacer::overhang_angle_threshold)
                                                              * po->layers()[layer_idx]->height;
                             perimeter_point.overhang =
@@ -1097,7 +1113,7 @@ void SeamPlacer::calculate_overhangs_and_layer_embedding(const PrintObject *po) 
 
                           if (should_compute_layer_embedding) { // search for embedded perimeter points (points hidden inside the print ,e.g. multimaterial join, best position for seam)
                             perimeter_point.embedded_distance = current_layer_distancer->distance_from_lines<true>(point.cast<double>())
-                                                                + 0.65f * perimeter_point.perimeter.flow_width;
+                                                                + 0.6f * perimeter_point.perimeter.flow_width;
                           }
                         }
 
@@ -1164,6 +1180,13 @@ std::optional<std::pair<size_t, size_t>> SeamPlacer::find_next_seam_in_layer(
       && (next_layer_seam.position - projected_position).squaredNorm()
              < sqr(3 * max_distance)) {
     return {std::pair<size_t, size_t> {layer_idx, nearest_point.perimeter.seam_index}};
+  }
+
+  // For Back, prefer the back-most nearby point. On a nearly flat back the nearest point is always acceptable and the seam would drift sideways.
+  // Points within 0.01 mm of the back-most Y count as equally far back (tessellation noise), so the nearest one is kept and the seam does not jitter.
+  if (comparator.setup == spRear && best_nearby_point.position.y() > nearest_point.position.y() + 0.01f &&
+      comparator.is_first_not_much_worse(best_nearby_point, next_layer_seam)) {
+    return {std::pair<size_t, size_t> {layer_idx, best_nearby_point_index}};
   }
 
   // First try to align the nearest, then try the best nearby
@@ -1310,7 +1333,9 @@ void SeamPlacer::align_seam_points(const PrintObject *po, const SeamPlacerImpl::
           seam_string = std::move(alternative_seam_string);
         }
       }
-      if (seam_string.size() < seam_align_minimum_string_seams) {
+      // Back: small loops that exist for only a few layers would otherwise keep their own back-most point and show a diagonal run of seams.
+      const size_t min_string_seams = comparator.setup == spRear ? 3 : seam_align_minimum_string_seams;
+      if (seam_string.size() < min_string_seams) {
         //string NOT long enough to be worth aligning, skip
         continue;
       }
@@ -1423,6 +1448,98 @@ void SeamPlacer::align_seam_points(const PrintObject *po, const SeamPlacerImpl::
 
 }
 
+namespace SeamPlacerImpl {
+
+// Back seams only. A loop that has a hidden seam (inside the print, e.g. at a multi-material join) on most layers can lose that
+// hidden stretch for a few layers. It then falls back to a point on the visible outline, and the seam shows up as a stray
+// seam or a sideways drift. Give such a loop the position its matching loops on the nearest layers above and below agree on.
+void bridge_layer_gaps(std::vector<PrintObjectSeamData::LayerSeams> &layers)
+{
+  constexpr size_t max_gap          = 3;     // layers searched on each side
+  constexpr float  max_anchor_dist  = 3.0f;  // mm, between the hidden seams above and below
+  constexpr float  hidden_threshold = -0.5f; // same threshold as the hidden point rule in SeamComparator
+  constexpr float  max_loop_dist    = 1.5f;  // mm, between the interpolated position and the nearest point of the loop
+
+  auto centroid = [](const PrintObjectSeamData::LayerSeams &layer, const Perimeter &perimeter) {
+    Vec2f sum = Vec2f::Zero();
+    for (size_t i = perimeter.start_index; i < perimeter.end_index; ++i)
+      sum += layer.points[i].position.head<2>();
+    return sum / float(std::max<size_t>(1, perimeter.end_index - perimeter.start_index));
+  };
+
+  // The seam of a loop that was not aligned is the point picked for it.
+  auto has_hidden_seam = [&](const PrintObjectSeamData::LayerSeams &layer, const Perimeter &perimeter) {
+    return layer.points[perimeter.seam_index].embedded_distance < hidden_threshold;
+  };
+  auto seam_position = [&](const PrintObjectSeamData::LayerSeams &layer, const Perimeter &perimeter) -> Vec2f {
+    return perimeter.finalized ? perimeter.final_seam_position.head<2>() : layer.points[perimeter.seam_index].position.head<2>();
+  };
+
+  // Loop of a neighbour layer with a hidden seam that matches the given loop by centroid and point count.
+  auto find_match = [&](const PrintObjectSeamData::LayerSeams &layer, const Vec2f &center, size_t point_count) -> const Perimeter * {
+    const Perimeter *best      = nullptr;
+    float            best_dist = 1.5f;
+    for (const Perimeter &candidate : layer.perimeters) {
+      const size_t count = candidate.end_index - candidate.start_index;
+      if (!has_hidden_seam(layer, candidate) || count * 4 < point_count * 3 || count * 3 > point_count * 4)
+        continue;
+      const float dist = (centroid(layer, candidate) - center).norm();
+      if (dist < best_dist) {
+        best      = &candidate;
+        best_dist = dist;
+      }
+    }
+    return best;
+  };
+
+  // Nearest layer in the given direction that has a matching loop with a hidden seam.
+  auto find_in_direction = [&](size_t layer_idx, int step, const Vec2f &center, size_t point_count) -> std::pair<const Perimeter *, size_t> {
+    for (size_t gap = 1; gap <= max_gap; ++gap) {
+      if (step < 0 && gap > layer_idx)
+        break;
+      const size_t other = step < 0 ? layer_idx - gap : layer_idx + gap;
+      if (other >= layers.size())
+        break;
+      if (const Perimeter *match = find_match(layers[other], center, point_count))
+        return {match, other};
+    }
+    return {nullptr, 0};
+  };
+
+  for (size_t layer_idx = 1; layer_idx + 1 < layers.size(); ++layer_idx) {
+    PrintObjectSeamData::LayerSeams &layer = layers[layer_idx];
+    for (Perimeter &perimeter : layer.perimeters) {
+      if (perimeter.end_index <= perimeter.start_index || has_hidden_seam(layer, perimeter))
+        continue;
+      const size_t point_count = perimeter.end_index - perimeter.start_index;
+      const Vec2f  center      = centroid(layer, perimeter);
+      const auto [below, below_idx] = find_in_direction(layer_idx, -1, center, point_count);
+      const auto [above, above_idx] = find_in_direction(layer_idx, 1, center, point_count);
+      if (below == nullptr || above == nullptr)
+        continue;
+      const Vec2f below_pos = seam_position(layers[below_idx], *below);
+      const Vec2f above_pos = seam_position(layers[above_idx], *above);
+      if ((below_pos - above_pos).norm() > max_anchor_dist)
+        continue;
+
+      const float t      = float(layer_idx - below_idx) / float(above_idx - below_idx);
+      const Vec2f target = below_pos + t * (above_pos - below_pos);
+      size_t      nearest = perimeter.start_index;
+      for (size_t i = perimeter.start_index; i < perimeter.end_index; ++i)
+        if ((layer.points[i].position.head<2>() - target).squaredNorm() < (layer.points[nearest].position.head<2>() - target).squaredNorm())
+          nearest = i;
+      // Only bridge when the loop actually passes by the position, otherwise the seam would land on a visible point elsewhere.
+      if ((layer.points[nearest].position.head<2>() - target).norm() > max_loop_dist)
+        continue;
+      perimeter.seam_index          = nearest;
+      perimeter.final_seam_position = Vec3f(target.x(), target.y(), layer.points[nearest].position.z());
+      perimeter.finalized           = true;
+    }
+  }
+}
+
+} // namespace SeamPlacerImpl
+
 void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_canceled_func) {
   using namespace SeamPlacerImpl;
   m_seam_per_object.clear();
@@ -1488,6 +1605,9 @@ void SeamPlacer::init(const Print &print, std::function<void(void)> throw_if_can
       align_seam_points(po, comparator);
       BOOST_LOG_TRIVIAL(debug)
           << "SeamPlacer: align_seam_points : end";
+      if (configured_seam_preference == spRear) {
+        bridge_layer_gaps(m_seam_per_object[po].layers);
+      }
     }
 
 #ifdef DEBUG_FILES
